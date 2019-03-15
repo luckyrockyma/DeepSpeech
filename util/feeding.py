@@ -34,12 +34,12 @@ def samples_to_mfccs(samples, sample_rate):
     return mfccs, tf.shape(mfccs)[0]
 
 
-def file_to_features(wav_filename):
+def file_to_features(wav_filename, transcript=None):
     samples = tf.read_file(wav_filename)
     decoded = contrib_audio.decode_wav(samples, desired_channels=1)
     features, features_len = samples_to_mfccs(decoded.audio, decoded.sample_rate)
 
-    return features, features_len
+    return features, features_len, transcript
 
 
 def sparse_tuple_from(sequences, dtype=np.int32):
@@ -74,21 +74,20 @@ def create_dataset(csvs, batch_size, cache_path):
 
     num_gpus = len(Config.available_devices)
 
-    # We create separate datasets for transcripts and audio features in order
-    # to be able to apply different batching logic to the sparse and dense
-    # tensors respectively. We then zip them into a single nested dataset.
-    transcript_set = (tf.data.Dataset.from_tensor_slices(transcripts)
-                                     .batch(batch_size,
-                                            drop_remainder=True))
+    filenames = tf.data.Dataset.from_tensor_slices(df['wav_filename'].values)
+    transcripts = tf.data.Dataset.from_tensor_slices(transcripts)
 
-    features_set = (tf.data.Dataset.from_tensor_slices(df['wav_filename'].values)
-                                   .map(file_to_features, num_parallel_calls=tf.data.experimental.AUTOTUNE)
-                                   .cache(cache_path)
-                                   .padded_batch(batch_size,
-                                                 padded_shapes=([None, Config.n_input], []),
-                                                 drop_remainder=True))
+    def batch_fn(features, features_len, transcripts):
+        features = tf.data.Dataset.zip((features, features_len))
+        features = features.padded_batch(batch_size,
+                                         padded_shapes=([None, Config.n_input], []))
+        transcripts = transcripts.batch(batch_size)
+        return tf.data.Dataset.zip((features, transcripts))
 
-    dataset = (tf.data.Dataset.zip((features_set, transcript_set))
+    dataset = (tf.data.Dataset.zip((filenames, transcripts))
+                              .map(file_to_features, num_parallel_calls=tf.data.experimental.AUTOTUNE)
+                              .cache(cache_path)
+                              .window(batch_size, drop_remainder=True).flat_map(batch_fn)
                               .prefetch(num_gpus)
                               .repeat())
 
