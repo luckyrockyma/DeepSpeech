@@ -34,32 +34,27 @@ def samples_to_mfccs(samples, sample_rate):
     return mfccs, tf.shape(mfccs)[0]
 
 
-def file_to_features(wav_filename, transcript=None):
+def audiofile_to_features(wav_filename):
     samples = tf.read_file(wav_filename)
     decoded = contrib_audio.decode_wav(samples, desired_channels=1)
     features, features_len = samples_to_mfccs(decoded.audio, decoded.sample_rate)
 
-    return features, features_len, transcript
+    return features, features_len
 
 
-def sparse_tuple_from(sequences, dtype=np.int32):
-    r"""Creates a sparse representention of ``sequences``.
-    Args:
-        * sequences: a list of lists of type dtype where each element is a sequence
-    Returns a tuple with (indices, values, shape)
+def entry_to_features(wav_filename, transcript):
+    # https://bugs.python.org/issue32117
+    features, features_len = audiofile_to_features(wav_filename)
+    return features, features_len, tf.SparseTensor(*transcript)
+
+
+def to_sparse_tuple(sequence):
+    r"""Creates a sparse representention of ``sequence``.
+        Returns a tuple with (indices, values, shape)
     """
-    indices = []
-    values = []
-
-    for n, seq in enumerate(sequences):
-        indices.extend(zip([n]*len(seq), range(len(seq))))
-        values.extend(seq)
-
-    indices = np.asarray(indices, dtype=np.int64)
-    values = np.asarray(values, dtype=dtype)
-    shape = np.asarray([len(sequences), indices.max(0)[1]+1], dtype=np.int64)
-
-    return tf.SparseTensor(indices=indices, values=values, dense_shape=shape)
+    indices = np.asarray(list(zip([0]*len(sequence), range(len(sequence)))), dtype=np.int64)
+    shape = np.asarray([1, len(sequence)], dtype=np.int64)
+    return indices, sequence, shape
 
 
 def create_dataset(csvs, batch_size, cache_path):
@@ -68,24 +63,32 @@ def create_dataset(csvs, batch_size, cache_path):
 
     num_batches = len(df) // batch_size
 
-    # Convert to character index arrays and then into a single SparseTensor
-    transcripts = df['transcript'].apply(partial(text_to_char_array, alphabet=Config.alphabet))
-    transcripts = sparse_tuple_from(transcripts.values)
+    # Convert to character index arrays
+    df['transcript'] = df['transcript'].apply(partial(text_to_char_array, alphabet=Config.alphabet))
 
-    num_gpus = len(Config.available_devices)
+    def generate_values():
+        for _, row in df.iterrows():
+            yield row.wav_filename, to_sparse_tuple(row.transcript)
 
-    filenames = tf.data.Dataset.from_tensor_slices(df['wav_filename'].values)
-    transcripts = tf.data.Dataset.from_tensor_slices(transcripts)
+    # Batching a dataset of 2D SparseTensors creates 3D batches, which fail
+    # when passed to tf.nn.ctc_loss, so we reshape them to remove the extra
+    # dimension here.
+    def sparse_reshape(sparse):
+        shape = sparse.dense_shape
+        return tf.sparse.reshape(sparse, [shape[0], shape[2]])
 
     def batch_fn(features, features_len, transcripts):
         features = tf.data.Dataset.zip((features, features_len))
         features = features.padded_batch(batch_size,
                                          padded_shapes=([None, Config.n_input], []))
-        transcripts = transcripts.batch(batch_size)
+        transcripts = transcripts.batch(batch_size).map(sparse_reshape)
         return tf.data.Dataset.zip((features, transcripts))
 
-    dataset = (tf.data.Dataset.zip((filenames, transcripts))
-                              .map(file_to_features, num_parallel_calls=tf.data.experimental.AUTOTUNE)
+    num_gpus = len(Config.available_devices)
+
+    dataset = (tf.data.Dataset.from_generator(generate_values,
+                                              output_types=(tf.string, (tf.int64, tf.int32, tf.int64)))
+                              .map(entry_to_features, num_parallel_calls=tf.data.experimental.AUTOTUNE)
                               .cache(cache_path)
                               .window(batch_size, drop_remainder=True).flat_map(batch_fn)
                               .prefetch(num_gpus)

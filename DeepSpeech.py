@@ -20,7 +20,7 @@ from six.moves import zip, range
 from tensorflow.python.tools import freeze_graph
 from util.config import Config, initialize_globals
 from util.coordinator import TrainingCoordinator
-from util.feeding import create_dataset, samples_to_mfccs, file_to_features
+from util.feeding import create_dataset, samples_to_mfccs, audiofile_to_features
 from util.flags import create_flags, FLAGS
 from util.logging import log_info, log_error, log_debug, log_warn
 from util.text import Alphabet
@@ -859,7 +859,7 @@ def do_single_file_inference(input_file_path):
         saver.restore(session, checkpoint_path)
         session.run(outputs['initialize_state'])
 
-        features, features_len = file_to_features(input_file_path)
+        features, features_len = audiofile_to_features(input_file_path)
 
         # Add batch dimension
         features = tf.expand_dims(features, 0)
