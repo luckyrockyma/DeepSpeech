@@ -3,7 +3,7 @@
 load("@org_tensorflow//tensorflow:tensorflow.bzl",
      "tf_cc_shared_object", "if_cuda")
 
-load("@org_tensorflow//tensorflow/contrib/lite:build_def.bzl",
+load("@org_tensorflow//tensorflow/lite:build_def.bzl",
      "tflite_copts", "tflite_linkopts")
 
 config_setting(
@@ -85,14 +85,12 @@ tf_cc_shared_object(
     linkopts = select({
         "//tensorflow:darwin": [],
         "//tensorflow:linux_x86_64": LINUX_LINKOPTS,
-        "//tensorflow:rpi3": LINUX_LINKOPTS + ["-l:libstdc++.a"],
-        "//tensorflow:rpi3-armv8": LINUX_LINKOPTS + ["-l:libstdc++.a"],
         "//tensorflow:windows": [],
         "//conditions:default": []
     }) + tflite_linkopts(),
     deps = select({
         "//native_client:tflite": [
-            "//tensorflow/contrib/lite/kernels:builtin_ops",
+            "//tensorflow/lite/kernels:builtin_ops",
         ],
         "//conditions:default": [
             "//tensorflow/core:core_cpu",
@@ -119,6 +117,9 @@ tf_cc_shared_object(
             "//tensorflow/core/kernels:control_flow_ops",   # Enter
             "//tensorflow/core/kernels:tile_ops",           # Tile
             "//tensorflow/core/kernels:gather_op",          # Gather
+            "//tensorflow/core/kernels:mfcc_op",            # Mfcc
+            "//tensorflow/core/kernels:spectrogram_op",     # AudioSpectrogram
+            "//tensorflow/core/kernels:strided_slice_op",   # StridedSlice
             "//tensorflow/contrib/rnn:lstm_ops_kernels",    # BlockLSTM
             "//tensorflow/core/kernels:random_ops",         # RandomGammaGrad
             "//tensorflow/core/kernels:pack_op",            # Pack
