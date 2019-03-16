@@ -89,14 +89,31 @@ def dense(name, x, units, dropout_rate=None, relu=True):
     return output
 
 
-def rnn_impl_lstmblockfusedcell(x, seq_length, previous_state, reuse):
+def rnn_impl_cudnn_rnn(x, seq_length, previous_state, reuse):
+    assert previous_state is None # 'Passing previous state not supported with CuDNN backend'
+
     # Forward direction cell:
-    fw_cell = tf.contrib.rnn.LSTMBlockFusedCell(Config.n_cell_dim, reuse=reuse)
+    fw_cell = tf.contrib.cudnn_rnn.CudnnLSTM(num_layers=1,
+                                             num_units=Config.n_cell_dim,
+                                             input_mode='skip_input',
+                                             direction='unidirectional',
+                                             dtype=tf.float32)
 
     output, output_state = fw_cell(inputs=x,
                                    dtype=tf.float32,
-                                   sequence_length=seq_length,
-                                   initial_state=previous_state)
+                                   sequence_lengths=seq_length)
+
+    return output, output_state
+
+
+def rnn_impl_lstmblockcell(x, seq_length, previous_state, reuse):
+    # Forward direction cell:
+    fw_cell = tf.contrib.cudnn_rnn.CudnnCompatibleLSTMCell(Config.n_cell_dim, reuse=reuse)
+
+    output, output_state = tf.nn.dynamic_rnn(cell=fw_cell,
+                                             inputs=x,
+                                             dtype=tf.float32,
+                                             time_major=True)
 
     return output, output_state
 
@@ -120,7 +137,7 @@ def rnn_impl_static_rnn(x, seq_length, previous_state, reuse):
     return output, output_state
 
 
-def create_model(batch_x, seq_length, dropout, reuse=False, previous_state=None, overlap=True, rnn_impl=rnn_impl_lstmblockfusedcell):
+def create_model(batch_x, seq_length, dropout, reuse=False, previous_state=None, overlap=True, rnn_impl=rnn_impl_lstmblockcell):
     layers = {}
 
     # Input shape: [batch_size, n_steps, n_input + 2*n_input*n_context]
@@ -194,6 +211,11 @@ def calculate_mean_edit_distance_and_loss(iterator, tower, dropout, reuse):
     '''
     # Obtain the next batch of data
     (batch_x, batch_seq_len), batch_y = iterator.get_next()
+
+    if FLAGS.use_cudnn_rnn:
+        rnn_impl = rnn_impl_cudnn_rnn
+    else:
+        rnn_impl = rnn_impl_lstmblockcell
 
     # Calculate the logits of the batch
     logits, _ = create_model(batch_x, batch_seq_len, dropout, reuse=reuse)
@@ -678,7 +700,7 @@ def create_inference_graph(batch_size=1, n_steps=16, tflite=False):
     if tflite:
         rnn_impl = rnn_impl_static_rnn
     else:
-        rnn_impl = rnn_impl_lstmblockfusedcell
+        rnn_impl = rnn_impl_lstmblockcell
 
     logits, layers = create_model(batch_x=input_tensor,
                                   seq_length=seq_length if FLAGS.use_seq_length else None,

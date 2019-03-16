@@ -68,6 +68,8 @@ def create_flags():
     tf.app.flags.DEFINE_integer ('inter_op_parallelism_threads', 0, 'number of inter-op parallelism threads - see tf.ConfigProto for more details')
     tf.app.flags.DEFINE_integer ('intra_op_parallelism_threads', 0, 'number of intra-op parallelism threads - see tf.ConfigProto for more details')
 
+    tf.app.flags.DEFINE_boolean ('use_cudnn_rnn',    False,       'use CuDNN RNN backend for training on GPU')
+
     # Sample limits
 
     tf.app.flags.DEFINE_integer ('limit_train',      0,           'maximum number of elements to use from train set - 0 means no limit')
