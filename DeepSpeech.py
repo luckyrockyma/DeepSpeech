@@ -518,6 +518,7 @@ def train(server=None):
     # MonitoredTrainingSession does a bunch of magic in its initialization that
     # requires the iterator to be initialized, so do that in the local init op.
     scaffold = tf.train.Scaffold(local_init_op=train_init_op)
+    last_set = 'train'
 
     # The MonitoredTrainingSession takes care of session initialization,
     # restoring from a checkpoint, saving to a checkpoint, and closing when done
@@ -565,7 +566,11 @@ def train(server=None):
                         'train': train_init_op,
                         'dev': dev_init_op,
                     }.get(job.set_name)
-                    session.run(iterator_init_op)
+
+                    if job.set_name != last_set:
+                        session.run(iterator_init_op)
+
+                    last_set = job.set_name
 
                     # Initialize loss aggregator
                     total_loss = 0.0
