@@ -9,7 +9,6 @@ import os
 import pandas
 import progressbar
 import sys
-import tables
 import tensorflow as tf
 
 from ds_ctcdecoder import ctc_beam_search_decoder_batch, Scorer
