@@ -23,7 +23,6 @@ from util.coordinator import TrainingCoordinator
 from util.feeding import create_dataset, samples_to_mfccs, audiofile_to_features
 from util.flags import create_flags, FLAGS
 from util.logging import log_info, log_error, log_debug, log_warn
-from util.text import Alphabet
 
 
 # Graph Creation
@@ -382,6 +381,7 @@ def train(server=None):
     # It will automagically get incremented by the optimizer.
     global_step = tf.Variable(0, trainable=False, name='global_step')
 
+    # One rate per layer
     dropout_rates = [tf.placeholder(tf.float32, name='dropout_{}'.format(i)) for i in range(6)]
 
     # Create training and validation datasets
@@ -463,12 +463,7 @@ def train(server=None):
         hooks.append(tf.train.CheckpointSaverHook(checkpoint_dir=FLAGS.checkpoint_dir, save_secs=FLAGS.checkpoint_secs, saver=saver))
 
     no_dropout_feed_dict = {
-        dropout_rates[0]: 0.,
-        dropout_rates[1]: 0.,
-        dropout_rates[2]: 0.,
-        dropout_rates[3]: 0.,
-        dropout_rates[4]: 0.,
-        dropout_rates[5]: 0.,
+        rate: 0. for rate in dropout_rates
     }
 
     # Progress Bar
@@ -667,6 +662,7 @@ def create_inference_graph(batch_size=1, n_steps=16, tflite=False):
 
         previous_state = tf.contrib.rnn.LSTMStateTuple(previous_state_c, previous_state_h)
 
+    # One rate per layer
     no_dropout = [None] * 6
 
     if tflite:

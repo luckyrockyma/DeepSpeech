@@ -5,27 +5,24 @@ from __future__ import absolute_import, division, print_function
 import itertools
 import json
 import numpy as np
-import os
-import pandas
 import progressbar
-import sys
 import tensorflow as tf
 
 from ds_ctcdecoder import ctc_beam_search_decoder_batch, Scorer
-from multiprocessing import Pool, cpu_count
+from multiprocessing import cpu_count
 from six.moves import zip, range
 from util.config import Config, initialize_globals
+from util.evaluate_tools import calculate_report
+from util.feeding import create_dataset
 from util.flags import create_flags, FLAGS
 from util.logging import log_error
-from util.feeding import create_dataset
-from util.text import Alphabet, levenshtein, text_to_char_array
-from util.evaluate_tools import process_decode_result, calculate_report
+from util.text import levenshtein
 
 
 def sparse_tensor_value_to_texts(value, alphabet):
     r"""
     Given a :class:`tf.SparseTensor` ``value``, return an array of Python strings
-    representing its values.
+    representing its values, converting tokens to strings using ``alphabet``.
     """
     return sparse_tuple_to_texts((value.indices, value.values, value.dense_shape), alphabet)
 
@@ -53,6 +50,7 @@ def evaluate(test_csvs, create_model):
 
     (batch_x, batch_x_len), batch_y = it.get_next()
 
+    # One rate per layer
     no_dropout = [None] * 6
     logits, _ = create_model(batch_x=batch_x,
                              seq_length=batch_x_len,
