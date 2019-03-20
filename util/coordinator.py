@@ -284,12 +284,13 @@ class TrainingCoordinator(object):
         for epoch in self._epochs_running:
             log_debug('       - running: ' + epoch.job_status())
 
-    def start_coordination(self, model_feeder, step=0):
+    def start_coordination(self, train_batches, dev_batches, step=0):
         '''Starts to coordinate epochs and jobs among workers on base of
         data-set sizes, the (global) step and FLAGS parameters.
 
         Args:
-            model_feeder (ModelFeeder): data-sets to be used for coordinated training
+            train_batches (int): number of batches in train set
+            dev_batches (int): number of batches in dev set
 
         Kwargs:
             step (int): global step of a loaded model to determine starting point
@@ -307,7 +308,7 @@ class TrainingCoordinator(object):
             batches_per_step = gpus_per_worker * max(1, FLAGS.replicas_to_agg)
 
             # Number of global steps per epoch - to be at least 1
-            steps_per_epoch = max(1, model_feeder.train.total_batches // batches_per_step)
+            steps_per_epoch = max(1, train_batches // batches_per_step)
 
             # The start epoch of our training
             self._epoch = step // steps_per_epoch
@@ -316,8 +317,8 @@ class TrainingCoordinator(object):
             jobs_trained = (step % steps_per_epoch) * batches_per_step // batches_per_job
 
             # Total number of train/dev jobs covering their respective whole sets (one epoch)
-            self._num_jobs_train = max(1, model_feeder.train.total_batches // batches_per_job)
-            self._num_jobs_dev   = max(1, model_feeder.dev.total_batches   // batches_per_job)
+            self._num_jobs_train = max(1, train_batches // batches_per_job)
+            self._num_jobs_dev   = max(1, dev_batches   // batches_per_job)
 
             if FLAGS.epoch < 0:
                 # A negative epoch means to add its absolute number to the epochs already computed
@@ -341,7 +342,7 @@ class TrainingCoordinator(object):
             log_debug('epoch: %d' % self._epoch)
             log_debug('target epoch: %d' % self._target_epoch)
             log_debug('steps per epoch: %d' % steps_per_epoch)
-            log_debug('number of batches in train set: %d' % model_feeder.train.total_batches)
+            log_debug('number of batches in train set: %d' % train_batches)
             log_debug('batches per job: %d' % batches_per_job)
             log_debug('batches per step: %d' % batches_per_step)
             log_debug('number of jobs in train set: %d' % self._num_jobs_train)

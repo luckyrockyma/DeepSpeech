@@ -18,13 +18,11 @@ import traceback
 from ds_ctcdecoder import ctc_beam_search_decoder, Scorer
 from six.moves import zip, range
 from tensorflow.python.tools import freeze_graph
-from util.audio import audiofile_to_input_vector
 from util.config import Config, initialize_globals
 from util.coordinator import TrainingCoordinator
-from util.feeding import DataSet, ModelFeeder
+from util.feeding import create_dataset, samples_to_mfccs, audiofile_to_features
 from util.flags import create_flags, FLAGS
 from util.logging import log_info, log_error, log_debug, log_warn
-from util.preprocess import preprocess
 from util.text import Alphabet
 
 
@@ -49,25 +47,82 @@ def variable_on_worker_level(name, shape, initializer):
     return var
 
 
-def BiRNN(batch_x, seq_length, dropout, reuse=False, batch_size=None, n_steps=-1, previous_state=None, tflite=False):
-    r'''
-    That done, we will define the learned variables, the weights and biases,
-    within the method ``BiRNN()`` which also constructs the neural network.
-    The variables named ``hn``, where ``n`` is an integer, hold the learned weight variables.
-    The variables named ``bn``, where ``n`` is an integer, hold the learned bias variables.
-    In particular, the first variable ``h1`` holds the learned weight matrix that
-    converts an input vector of dimension ``n_input + 2*n_input*n_context``
-    to a vector of dimension ``n_hidden_1``.
-    Similarly, the second variable ``h2`` holds the weight matrix converting
-    an input vector of dimension ``n_hidden_1`` to one of dimension ``n_hidden_2``.
-    The variables ``h3``, ``h5``, and ``h6`` are similar.
-    Likewise, the biases, ``b1``, ``b2``..., hold the biases for the various layers.
-    '''
+def create_overlapping_windows(batch_x):
+    batch_size = tf.shape(batch_x)[0]
+    window_width = 2 * Config.n_context + 1
+    num_channels = Config.n_input
+
+    # Create a constant convolution filter using an identity matrix, so that the
+    # convolution returns patches of the input tensor as is, and we can create
+    # overlapping windows over the MFCCs.
+    eye_filter = tf.constant(np.eye(window_width * num_channels)
+                               .reshape(window_width, num_channels, window_width * num_channels), tf.float32)
+
+    # Create overlapping windows
+    batch_x = tf.nn.conv1d(batch_x, eye_filter, stride=1, padding='SAME')
+
+    # Remove dummy depth dimension and reshape into [batch_size, n_windows, window_width, n_input]
+    batch_x = tf.reshape(batch_x, [batch_size, -1, window_width, num_channels])
+
+    return batch_x
+
+
+def dense(name, x, units, dropout_rate=None, relu=True):
+    with tf.variable_scope(name):
+        bias = variable_on_worker_level('bias', [units], tf.zeros_initializer())
+        weights = variable_on_worker_level('weights', [x.shape[-1], units], tf.contrib.layers.xavier_initializer())
+
+    output = tf.nn.bias_add(tf.matmul(x, weights), bias)
+
+    if relu:
+        output = tf.minimum(tf.nn.relu(output), FLAGS.relu_clip)
+
+    if dropout_rate is not None:
+        output = tf.nn.dropout(output, rate=dropout_rate)
+
+    return output
+
+
+def rnn_impl_lstmblockfusedcell(x, seq_length, previous_state, reuse):
+    # Forward direction cell:
+    fw_cell = tf.contrib.rnn.LSTMBlockFusedCell(Config.n_cell_dim, reuse=reuse)
+
+    output, output_state = fw_cell(inputs=x,
+                                   dtype=tf.float32,
+                                   sequence_length=seq_length,
+                                   initial_state=previous_state)
+
+    return output, output_state
+
+
+def rnn_impl_static_rnn(x, seq_length, previous_state, reuse):
+    # Forward direction cell:
+    fw_cell = tf.nn.rnn_cell.LSTMCell(Config.n_cell_dim, reuse=reuse)
+
+    # Split rank N tensor into list of rank N-1 tensors
+    x = [x[l] for l in range(x.shape[0])]
+
+    # We parametrize the RNN implementation as the training and inference graph
+    # need to do different things here.
+    output, output_state = tf.nn.static_rnn(cell=fw_cell,
+                                            inputs=x,
+                                            initial_state=previous_state,
+                                            dtype=tf.float32,
+                                            sequence_length=seq_length)
+    output = tf.concat(output, 0)
+
+    return output, output_state
+
+
+def create_model(batch_x, seq_length, dropout, reuse=False, previous_state=None, overlap=True, rnn_impl=rnn_impl_lstmblockfusedcell):
     layers = {}
 
     # Input shape: [batch_size, n_steps, n_input + 2*n_input*n_context]
-    if not batch_size:
-        batch_size = tf.shape(batch_x)[0]
+    batch_size = tf.shape(batch_x)[0]
+
+    # Create overlapping feature windows if needed
+    if overlap:
+        batch_x = create_overlapping_windows(batch_x)
 
     # Reshaping `batch_x` to a tensor with shape `[n_steps*batch_size, n_input + 2*n_input*n_context]`.
     # This is done to prepare the batch for input into the first layer which expects a tensor of rank `2`.
@@ -81,57 +136,17 @@ def BiRNN(batch_x, seq_length, dropout, reuse=False, batch_size=None, n_steps=-1
     # The next three blocks will pass `batch_x` through three hidden layers with
     # clipped RELU activation and dropout.
 
-    # 1st layer
-    b1 = variable_on_worker_level('b1', [Config.n_hidden_1], tf.zeros_initializer())
-    h1 = variable_on_worker_level('h1', [Config.n_input + 2*Config.n_input*Config.n_context, Config.n_hidden_1], tf.contrib.layers.xavier_initializer())
-    layer_1 = tf.minimum(tf.nn.relu(tf.add(tf.matmul(batch_x, h1), b1)), FLAGS.relu_clip)
-    layer_1 = tf.nn.dropout(layer_1, rate=dropout[0])
-    layers['layer_1'] = layer_1
-
-    # 2nd layer
-    b2 = variable_on_worker_level('b2', [Config.n_hidden_2], tf.zeros_initializer())
-    h2 = variable_on_worker_level('h2', [Config.n_hidden_1, Config.n_hidden_2], tf.contrib.layers.xavier_initializer())
-    layer_2 = tf.minimum(tf.nn.relu(tf.add(tf.matmul(layer_1, h2), b2)), FLAGS.relu_clip)
-    layer_2 = tf.nn.dropout(layer_2, rate=dropout[1])
-    layers['layer_2'] = layer_2
-
-    # 3rd layer
-    b3 = variable_on_worker_level('b3', [Config.n_hidden_3], tf.zeros_initializer())
-    h3 = variable_on_worker_level('h3', [Config.n_hidden_2, Config.n_hidden_3], tf.contrib.layers.xavier_initializer())
-    layer_3 = tf.minimum(tf.nn.relu(tf.add(tf.matmul(layer_2, h3), b3)), FLAGS.relu_clip)
-    layer_3 = tf.nn.dropout(layer_3, rate=dropout[2])
-    layers['layer_3'] = layer_3
-
-    # Now we create the forward and backward LSTM units.
-    # Both of which have inputs of length `n_cell_dim` and bias `1.0` for the forget gate of the LSTM.
-
-    # Forward direction cell:
-    if not tflite:
-        fw_cell = tf.contrib.rnn.LSTMBlockFusedCell(Config.n_cell_dim, reuse=reuse)
-        layers['fw_cell'] = fw_cell
-    else:
-        fw_cell = tf.nn.rnn_cell.LSTMCell(Config.n_cell_dim, reuse=reuse)
+    layers['layer_1'] = layer_1 = dense('layer_1', batch_x, Config.n_hidden_1)
+    layers['layer_2'] = layer_2 = dense('layer_2', layer_1, Config.n_hidden_2)
+    layers['layer_3'] = layer_3 = dense('layer_3', layer_2, Config.n_hidden_3)
 
     # `layer_3` is now reshaped into `[n_steps, batch_size, 2*n_cell_dim]`,
     # as the LSTM RNN expects its input to be of shape `[max_time, batch_size, input_size]`.
-    layer_3 = tf.reshape(layer_3, [n_steps, batch_size, Config.n_hidden_3])
-    if tflite:
-        # Generated StridedSlice, not supported by NNAPI
-        #n_layer_3 = []
-        #for l in range(layer_3.shape[0]):
-        #    n_layer_3.append(layer_3[l])
-        #layer_3 = n_layer_3
+    layer_3 = tf.reshape(layer_3, [-1, batch_size, Config.n_hidden_3])
 
-        # Unstack/Unpack is not supported by NNAPI
-        layer_3 = tf.unstack(layer_3, n_steps)
-
-    # We parametrize the RNN implementation as the training and inference graph
-    # need to do different things here.
-    if not tflite:
-        output, output_state = fw_cell(inputs=layer_3, dtype=tf.float32, sequence_length=seq_length, initial_state=previous_state)
-    else:
-        output, output_state = tf.nn.static_rnn(fw_cell, layer_3, previous_state, tf.float32)
-        output = tf.concat(output, 0)
+    # Run through parametrized RNN implementation, as we use different RNNs
+    # for training and inference
+    output, output_state = rnn_impl(layer_3, seq_length, previous_state, reuse)
 
     # Reshape output from a tensor of shape [n_steps, batch_size, n_cell_dim]
     # to a tensor of shape [n_steps*batch_size, n_cell_dim]
@@ -139,24 +154,16 @@ def BiRNN(batch_x, seq_length, dropout, reuse=False, batch_size=None, n_steps=-1
     layers['rnn_output'] = output
     layers['rnn_output_state'] = output_state
 
-    # Now we feed `output` to the fifth hidden layer with clipped RELU activation and dropout
-    b5 = variable_on_worker_level('b5', [Config.n_hidden_5], tf.zeros_initializer())
-    h5 = variable_on_worker_level('h5', [Config.n_cell_dim, Config.n_hidden_5], tf.contrib.layers.xavier_initializer())
-    layer_5 = tf.minimum(tf.nn.relu(tf.add(tf.matmul(output, h5), b5)), FLAGS.relu_clip)
-    layer_5 = tf.nn.dropout(layer_5, rate=dropout[5])
-    layers['layer_5'] = layer_5
+    # Now we feed `output` to the fifth hidden layer with clipped RELU activation
+    layers['layer_5'] = layer_5 = dense('layer_5', output, Config.n_hidden_5)
 
-    # Now we apply the weight matrix `h6` and bias `b6` to the output of `layer_5`
-    # creating `n_classes` dimensional vectors, the logits.
-    b6 = variable_on_worker_level('b6', [Config.n_hidden_6], tf.zeros_initializer())
-    h6 = variable_on_worker_level('h6', [Config.n_hidden_5, Config.n_hidden_6], tf.contrib.layers.xavier_initializer())
-    layer_6 = tf.add(tf.matmul(layer_5, h6), b6)
-    layers['layer_6'] = layer_6
+    # Now we apply a final linear layer creating `n_classes` dimensional vectors, the logits.
+    layers['layer_6'] = layer_6 = dense('layer_6', layer_5, Config.n_hidden_6, relu=False)
 
     # Finally we reshape layer_6 from a tensor of shape [n_steps*batch_size, n_hidden_6]
     # to the slightly more useful shape [n_steps, batch_size, n_hidden_6].
     # Note, that this differs from the input in that it is time-major.
-    layer_6 = tf.reshape(layer_6, [n_steps, batch_size, Config.n_hidden_6], name="raw_logits")
+    layer_6 = tf.reshape(layer_6, [-1, batch_size, Config.n_hidden_6], name='raw_logits')
     layers['raw_logits'] = layer_6
 
     # Output shape: [n_steps, batch_size, n_hidden_6]
@@ -173,17 +180,17 @@ def BiRNN(batch_x, seq_length, dropout, reuse=False, batch_size=None, n_steps=-1
 # Conveniently, this loss function is implemented in TensorFlow.
 # Thus, we can simply make use of this implementation to define our loss.
 
-def calculate_mean_edit_distance_and_loss(model_feeder, tower, dropout, reuse):
+def calculate_mean_edit_distance_and_loss(iterator, tower, dropout, reuse):
     r'''
     This routine beam search decodes a mini-batch and calculates the loss and mean edit distance.
     Next to total and average loss it returns the mean edit distance,
     the decoded result and the batch's original Y.
     '''
     # Obtain the next batch of data
-    batch_x, batch_seq_len, batch_y = model_feeder.next_batch(tower)
+    (batch_x, batch_seq_len), batch_y = iterator.get_next()
 
-    # Calculate the logits of the batch using BiRNN
-    logits, _ = BiRNN(batch_x, batch_seq_len, dropout, reuse)
+    # Calculate the logits of the batch
+    logits, _ = create_model(batch_x, batch_seq_len, dropout, reuse=reuse)
 
     # Compute the CTC loss using TensorFlow's `ctc_loss`
     total_loss = tf.nn.ctc_loss(labels=batch_y, inputs=logits, sequence_length=batch_seq_len)
@@ -228,7 +235,7 @@ def create_optimizer():
 # on which all operations within the tower execute.
 # For example, all operations of 'tower 0' could execute on the first GPU `tf.device('/gpu:0')`.
 
-def get_tower_results(model_feeder, optimizer, dropout_rates):
+def get_tower_results(iterator, optimizer, dropout_rates):
     r'''
     With this preliminary step out of the way, we can for each GPU introduce a
     tower for which's batch we calculate and return the optimization gradients
@@ -253,7 +260,7 @@ def get_tower_results(model_feeder, optimizer, dropout_rates):
                 with tf.name_scope('tower_%d' % i) as scope:
                     # Calculate the avg_loss and mean_edit_distance and retrieve the decoded
                     # batch along with the original batch's labels (Y) of this tower
-                    avg_loss = calculate_mean_edit_distance_and_loss(model_feeder, i, dropout_rates, reuse=i>0)
+                    avg_loss = calculate_mean_edit_distance_and_loss(iterator, i, dropout_rates, reuse=i>0)
 
                     # Allow for variables to be re-used by the next tower
                     tf.get_variable_scope().reuse_variables()
@@ -377,39 +384,22 @@ def train(server=None):
 
     dropout_rates = [tf.placeholder(tf.float32, name='dropout_{}'.format(i)) for i in range(6)]
 
-    # Reading training set
-    train_data = preprocess(FLAGS.train_files.split(','),
-                            FLAGS.train_batch_size,
-                            Config.n_input,
-                            Config.n_context,
-                            Config.alphabet,
-                            hdf5_cache_path=FLAGS.train_cached_features_path)
+    # Create training and validation datasets
+    train_set, train_batches = create_dataset(FLAGS.train_files.split(','),
+                                              batch_size=FLAGS.train_batch_size,
+                                              cache_path=FLAGS.train_cached_features_path)
 
-    train_set = DataSet(train_data,
-                        FLAGS.train_batch_size,
-                        limit=FLAGS.limit_train,
-                        next_index=lambda i: coord.get_next_index('train'))
+    dev_set, dev_batches = create_dataset(FLAGS.dev_files.split(','),
+                                          batch_size=FLAGS.dev_batch_size,
+                                          cache_path=FLAGS.dev_cached_features_path)
 
-    # Reading validation set
-    dev_data = preprocess(FLAGS.dev_files.split(','),
-                          FLAGS.dev_batch_size,
-                          Config.n_input,
-                          Config.n_context,
-                          Config.alphabet,
-                          hdf5_cache_path=FLAGS.dev_cached_features_path)
+    iterator = tf.data.Iterator.from_structure(train_set.output_types,
+                                               train_set.output_shapes,
+                                               output_classes=train_set.output_classes)
 
-    dev_set = DataSet(dev_data,
-                      FLAGS.dev_batch_size,
-                      limit=FLAGS.limit_dev,
-                      next_index=lambda i: coord.get_next_index('dev'))
-
-    # Combining all sets to a multi set model feeder
-    model_feeder = ModelFeeder(train_set,
-                               dev_set,
-                               Config.n_input,
-                               Config.n_context,
-                               Config.alphabet,
-                               tower_feeder_count=len(Config.available_devices))
+    # Make initialization ops for switching between the two sets
+    train_init_op = iterator.make_initializer(train_set)
+    dev_init_op = iterator.make_initializer(dev_set)
 
     # Create the optimizer
     optimizer = create_optimizer()
@@ -421,7 +411,7 @@ def train(server=None):
                                                    total_num_replicas=FLAGS.replicas)
 
     # Get the data_set specific graph end-points
-    gradients, loss = get_tower_results(model_feeder, optimizer, dropout_rates)
+    gradients, loss = get_tower_results(iterator, optimizer, dropout_rates)
 
     # Average tower gradients across GPUs
     avg_tower_gradients = average_gradients(gradients)
@@ -452,17 +442,7 @@ def train(server=None):
         Embedded coordination hook-class that will use variables of the
         surrounding Python context.
         '''
-        def after_create_session(self, session, coord):
-            log_debug('Starting queue runners...')
-            model_feeder.start_queue_threads(session, coord)
-            log_debug('Queue runners started.')
-
         def end(self, session):
-            # Closing the data_set queues
-            log_debug('Closing queues...')
-            model_feeder.close_queues(session)
-            log_debug('Queues closed.')
-
             # Telling the ps that we are done
             send_token_to_ps(session)
 
@@ -529,6 +509,11 @@ def train(server=None):
     # Initialize update_progressbar()'s child fields to safe values
     update_progressbar.pbar = None
 
+    # MonitoredTrainingSession does a bunch of magic in its initialization that
+    # requires the iterator to be initialized, so do that in the local init op.
+    scaffold = tf.train.Scaffold(local_init_op=train_init_op)
+    last_set = 'train'
+
     # The MonitoredTrainingSession takes care of session initialization,
     # restoring from a checkpoint, saving to a checkpoint, and closing when done
     # or an error occurs.
@@ -537,6 +522,7 @@ def train(server=None):
                                                is_chief=Config.is_chief,
                                                hooks=hooks,
                                                checkpoint_dir=FLAGS.checkpoint_dir,
+                                               scaffold=scaffold,
                                                save_checkpoint_secs=None, # already taken care of by a hook
                                                log_step_count_steps=0, # disable logging of steps/s to avoid TF warning in validation sets
                                                config=Config.session_config) as session:
@@ -545,9 +531,8 @@ def train(server=None):
             try:
                 if Config.is_chief:
                     # Retrieving global_step from the (potentially restored) model
-                    model_feeder.set_data_set(no_dropout_feed_dict, model_feeder.train)
                     step = session.run(global_step, feed_dict=no_dropout_feed_dict)
-                    coord.start_coordination(model_feeder, step)
+                    coord.start_coordination(train_batches, dev_batches, step)
 
                 # Get the first job
                 job = coord.get_job()
@@ -571,7 +556,15 @@ def train(server=None):
                         feed_dict = no_dropout_feed_dict
 
                     # Sets the current data_set for the respective placeholder in feed_dict
-                    model_feeder.set_data_set(feed_dict, getattr(model_feeder, job.set_name))
+                    iterator_init_op = {
+                        'train': train_init_op,
+                        'dev': dev_init_op,
+                    }.get(job.set_name)
+
+                    if job.set_name != last_set:
+                        session.run(iterator_init_op)
+
+                    last_set = job.set_name
 
                     # Initialize loss aggregator
                     total_loss = 0.0
@@ -644,22 +637,21 @@ def train(server=None):
 
 
 def test():
-    # Reading test set
-    test_data = preprocess(FLAGS.test_files.split(','),
-                           FLAGS.test_batch_size,
-                           Config.n_input,
-                           Config.n_context,
-                           Config.alphabet,
-                           hdf5_cache_path=FLAGS.test_cached_features_path)
-
-    graph = create_inference_graph(batch_size=FLAGS.test_batch_size, n_steps=-1)
-    evaluate.evaluate(test_data, graph)
+    evaluate.evaluate(FLAGS.test_files.split(','), create_model)
 
 
 def create_inference_graph(batch_size=1, n_steps=16, tflite=False):
     batch_size = batch_size if batch_size > 0 else None
+
+    # Create feature computation graph
+    input_samples = tf.placeholder(tf.float32, [None], 'input_samples')
+    samples = tf.expand_dims(input_samples, -1)
+    mfccs, mfccs_len = samples_to_mfccs(samples, 16000)
+    mfccs = tf.identity(mfccs, name='mfccs')
+    mfccs_len = tf.identity(mfccs_len, name='mfccs_len')
+
     # Input tensor will be of shape [batch_size, n_steps, 2*n_context+1, n_input]
-    input_tensor = tf.placeholder(tf.float32, [batch_size, n_steps if n_steps > 0 else None, 2*Config.n_context+1, Config.n_input], name='input_node')
+    input_tensor = tf.placeholder(tf.float32, [batch_size, n_steps if n_steps > 0 else None, 2 * Config.n_context + 1, Config.n_input], name='input_node')
     seq_length = tf.placeholder(tf.int32, [batch_size], name='input_lengths')
 
     if batch_size <= 0:
@@ -675,15 +667,19 @@ def create_inference_graph(batch_size=1, n_steps=16, tflite=False):
 
         previous_state = tf.contrib.rnn.LSTMStateTuple(previous_state_c, previous_state_h)
 
-    no_dropout = [0.0] * 6
+    no_dropout = [None] * 6
 
-    logits, layers = BiRNN(batch_x=input_tensor,
-                           seq_length=seq_length if FLAGS.use_seq_length else None,
-                           dropout=no_dropout,
-                           batch_size=batch_size,
-                           n_steps=n_steps,
-                           previous_state=previous_state,
-                           tflite=tflite)
+    if tflite:
+        rnn_impl = rnn_impl_static_rnn
+    else:
+        rnn_impl = rnn_impl_lstmblockfusedcell
+
+    logits, layers = create_model(batch_x=input_tensor,
+                                  seq_length=seq_length if FLAGS.use_seq_length else None,
+                                  dropout=no_dropout,
+                                  previous_state=previous_state,
+                                  overlap=False,
+                                  rnn_impl=rnn_impl)
 
     # TF Lite runtime will check that input dimensions are 1, 2 or 4
     # by default we get 3, the middle one being batch_size which is forced to
@@ -723,10 +719,13 @@ def create_inference_graph(batch_size=1, n_steps=16, tflite=False):
             {
                 'input': input_tensor,
                 'input_lengths': seq_length,
+                'input_samples': input_samples,
             },
             {
                 'outputs': logits,
                 'initialize_state': initialize_state,
+                'mfccs': mfccs,
+                'mfccs_len': mfccs_len,
             },
             layers
         )
@@ -735,16 +734,24 @@ def create_inference_graph(batch_size=1, n_steps=16, tflite=False):
         new_state_c = tf.identity(new_state_c, name='new_state_c')
         new_state_h = tf.identity(new_state_h, name='new_state_h')
 
+        inputs = {
+            'input': input_tensor,
+            'previous_state_c': previous_state_c,
+            'previous_state_h': previous_state_h,
+            'input_samples': input_samples,
+        }
+
+        if FLAGS.use_seq_length:
+            inputs.update({'input_lengths': seq_length})
+
         return (
-            {
-                'input': input_tensor,
-                'previous_state_c': previous_state_c,
-                'previous_state_h': previous_state_h,
-            },
+            inputs,
             {
                 'outputs': logits,
                 'new_state_c': new_state_c,
                 'new_state_h': new_state_h,
+                'mfccs': mfccs,
+                'mfccs_len': mfccs_len,
             },
             layers
         )
@@ -817,6 +824,8 @@ def export():
 
                 converter = tf.lite.TFLiteConverter(frozen_graph, input_tensors=inputs.values(), output_tensors=outputs.values())
                 converter.post_training_quantize = True
+                # AudioSpectrogram and Mfcc ops are custom but have built-in kernels in TFLite
+                converter.allow_custom_ops = True
                 tflite_model = converter.convert()
 
                 with open(output_tflite_path, 'wb') as fout:
@@ -827,6 +836,7 @@ def export():
             log_info('Models exported at %s' % (FLAGS.export_dir))
         except RuntimeError as e:
             log_error(str(e))
+
 
 def do_single_file_inference(input_file_path):
     with tf.Session(config=Config.session_config) as session:
@@ -848,22 +858,20 @@ def do_single_file_inference(input_file_path):
         saver.restore(session, checkpoint_path)
         session.run(outputs['initialize_state'])
 
-        features = audiofile_to_input_vector(input_file_path, Config.n_input, Config.n_context)
-        num_strides = len(features) - (Config.n_context * 2)
+        features, features_len = audiofile_to_features(input_file_path)
 
-        # Create a view into the array with overlapping strides of size
-        # numcontext (past) + 1 (present) + numcontext (future)
-        window_size = 2*Config.n_context+1
-        features = np.lib.stride_tricks.as_strided(
-            features,
-            (num_strides, window_size, Config.n_input),
-            (features.strides[0], features.strides[0], features.strides[1]),
-            writeable=False)
+        # Add batch dimension
+        features = tf.expand_dims(features, 0)
+        features_len = tf.expand_dims(features_len, 0)
 
-        logits = session.run(outputs['outputs'], feed_dict = {
-            inputs['input']: [features],
-            inputs['input_lengths']: [num_strides],
-        })
+        # Evaluate
+        features = create_overlapping_windows(features).eval(session=session)
+        features_len = features_len.eval(session=session)
+
+        logits = outputs['outputs'].eval(feed_dict={
+            inputs['input']: features,
+            inputs['input_lengths']: features_len,
+        }, session=session)
 
         logits = np.squeeze(logits)
 

@@ -120,14 +120,15 @@ def initialize_globals():
         with tf.device('/job:ps/task:%d' % i):
             done_queues.append(tf.FIFOQueue(1, tf.int32, shared_name=('queue%i' % i)))
 
-    # Placeholder to pass in the worker's index as token
-    c.token_placeholder = tf.placeholder(tf.int32)
+    if not tf.executing_eagerly():
+        # Placeholder to pass in the worker's index as token
+        c.token_placeholder = tf.placeholder(tf.int32)
 
-    # Enqueue operations for each parameter server
-    c.done_enqueues = [queue.enqueue(c.token_placeholder) for queue in done_queues]
+        # Enqueue operations for each parameter server
+        c.done_enqueues = [queue.enqueue(c.token_placeholder) for queue in done_queues]
 
-    # Dequeue operations for each parameter server
-    c.done_dequeues = [queue.dequeue() for queue in done_queues]
+        # Dequeue operations for each parameter server
+        c.done_dequeues = [queue.dequeue() for queue in done_queues]
 
     if len(FLAGS.one_shot_infer) > 0:
         FLAGS.train = False
